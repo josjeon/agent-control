@@ -100,6 +100,104 @@ def test_get_unknown_binding_returns_404(client: TestClient) -> None:
     assert resp.json()["error_code"] == "CONTROL_BINDING_NOT_FOUND"
 
 
+def test_binding_id_routes_authorize_the_stored_target(client: TestClient) -> None:
+    # Given a binding whose opaque target is stored only in the database.
+    control_id = _create_control(client)
+    binding_id = _create_binding(
+        client,
+        control_id=control_id,
+        target_type="custom_target",
+        target_id="target-42",
+    )["binding_id"]
+    calls: list[tuple[Operation, dict[str, Any] | None]] = []
+
+    class RecordingAuthorizer:
+        async def authorize(
+            self,
+            request: Any,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> Principal:
+            del request
+            calls.append((operation, context))
+            return Principal(namespace_key=DEFAULT_NAMESPACE_KEY, is_admin=True)
+
+    set_authorizer(RecordingAuthorizer())
+
+    # When each by-ID route is called without target data in the request.
+    get_resp = client.get(f"{_BINDINGS_URL}/{binding_id}")
+    patch_resp = client.patch(f"{_BINDINGS_URL}/{binding_id}", json={"enabled": False})
+    delete_resp = client.delete(f"{_BINDINGS_URL}/{binding_id}")
+
+    # Then every authorization call receives the target stored on the binding.
+    assert get_resp.status_code == 200, get_resp.text
+    assert patch_resp.status_code == 200, patch_resp.text
+    assert delete_resp.status_code == 200, delete_resp.text
+    target_context = {"target_type": "custom_target", "target_id": "target-42"}
+    assert calls == [
+        (Operation.CONTROL_BINDINGS_READ, target_context),
+        (Operation.CONTROL_BINDINGS_WRITE, target_context),
+        (Operation.CONTROL_BINDINGS_WRITE, target_context),
+    ]
+
+
+def test_binding_id_delete_rechecks_the_authorized_namespace(
+    client: TestClient,
+) -> None:
+    # Given a binding in the default namespace and an authorizer resolving another one.
+    control_id = _create_control(client)
+    binding_id = _create_binding(client, control_id=control_id)["binding_id"]
+    authorized_namespace = "other-namespace"
+
+    class NamespaceAuthorizer:
+        async def authorize(
+            self,
+            request: Any,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> Principal:
+            del request, operation, context
+            return Principal(namespace_key=authorized_namespace, is_admin=True)
+
+    set_authorizer(NamespaceAuthorizer())
+
+    # When deletion is authorized for a namespace that does not own the row.
+    delete_resp = client.delete(f"{_BINDINGS_URL}/{binding_id}")
+
+    # Then the scoped mutation is rejected and the original binding remains.
+    assert delete_resp.status_code == 404
+    authorized_namespace = DEFAULT_NAMESPACE_KEY
+    get_resp = client.get(f"{_BINDINGS_URL}/{binding_id}")
+    assert get_resp.status_code == 200, get_resp.text
+
+
+def test_binding_id_path_validation_runs_before_authorization(
+    client: TestClient,
+) -> None:
+    # Given an authorizer that records every invocation.
+    calls: list[Operation] = []
+
+    class RecordingAuthorizer:
+        async def authorize(
+            self,
+            request: Any,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> Principal:
+            del request, context
+            calls.append(operation)
+            return Principal(namespace_key=DEFAULT_NAMESPACE_KEY, is_admin=True)
+
+    set_authorizer(RecordingAuthorizer())
+
+    # When a caller supplies a non-integer binding ID.
+    resp = client.get(f"{_BINDINGS_URL}/not-an-integer")
+
+    # Then FastAPI reports validation without loading or authorizing a binding.
+    assert resp.status_code == 422
+    assert calls == []
+
+
 def test_list_bindings_returns_all(client: TestClient) -> None:
     control_id = _create_control(client)
     _create_binding(
@@ -251,6 +349,10 @@ def test_non_admin_cannot_write(non_admin_client: TestClient, client: TestClient
 
     delete_resp = non_admin_client.delete(f"{_BINDINGS_URL}/{binding_id}")
     assert delete_resp.status_code == 403
+
+    unchanged = client.get(f"{_BINDINGS_URL}/{binding_id}")
+    assert unchanged.status_code == 200, unchanged.text
+    assert unchanged.json()["enabled"] is True
 
 
 def test_non_admin_can_read(non_admin_client: TestClient, client: TestClient) -> None:
