@@ -171,6 +171,40 @@ def test_binding_id_delete_rechecks_the_authorized_namespace(
     assert get_resp.status_code == 200, get_resp.text
 
 
+def test_binding_id_patch_rechecks_the_authorized_namespace(
+    client: TestClient,
+) -> None:
+    # Given a binding in the default namespace and an authorizer resolving another one.
+    control_id = _create_control(client)
+    binding_id = _create_binding(client, control_id=control_id)["binding_id"]
+    authorized_namespace = "other-namespace"
+
+    class NamespaceAuthorizer:
+        async def authorize(
+            self,
+            request: Any,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> Principal:
+            del request, operation, context
+            return Principal(namespace_key=authorized_namespace, is_admin=True)
+
+    set_authorizer(NamespaceAuthorizer())
+
+    # When an update is authorized for a namespace that does not own the row.
+    patch_resp = client.patch(
+        f"{_BINDINGS_URL}/{binding_id}",
+        json={"enabled": False},
+    )
+
+    # Then the scoped mutation is rejected and the original binding remains enabled.
+    assert patch_resp.status_code == 404
+    authorized_namespace = DEFAULT_NAMESPACE_KEY
+    get_resp = client.get(f"{_BINDINGS_URL}/{binding_id}")
+    assert get_resp.status_code == 200, get_resp.text
+    assert get_resp.json()["enabled"] is True
+
+
 def test_binding_id_path_validation_runs_before_authorization(
     client: TestClient,
 ) -> None:
