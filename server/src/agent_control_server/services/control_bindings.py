@@ -238,31 +238,26 @@ class ControlBindingsService:
         result = await self._db.execute(stmt)
         binding = cast(ControlBinding | None, result.scalars().first())
         if binding is None:
-            raise self._binding_not_found(binding_id)
+            raise self.binding_not_found(binding_id)
         return binding
 
     async def get_binding_target_for_authorization_or_404(
-        self, *, binding_id: int
+        self, *, namespace_key: str, binding_id: int
     ) -> tuple[str, str]:
-        """Load the stored target needed to authorize a by-ID request.
-
-        This lookup is intentionally not namespace-scoped because authorization
-        resolves the request namespace from the stored target. It is not a data
-        access check: callers must re-read the binding with
-        :meth:`get_binding_or_404` after authorization succeeds.
-        """
+        """Load a binding's target within the authenticated namespace."""
         stmt = select(ControlBinding.target_type, ControlBinding.target_id).where(
-            ControlBinding.id == binding_id
+            ControlBinding.id == binding_id,
+            ControlBinding.namespace_key == namespace_key,
         )
         result = await self._db.execute(stmt)
         target = result.tuples().first()
         if target is None:
-            raise self._binding_not_found(binding_id)
+            raise self.binding_not_found(binding_id)
         target_type, target_id = target
         return target_type, target_id
 
     @staticmethod
-    def _binding_not_found(binding_id: int) -> NotFoundError:
+    def binding_not_found(binding_id: int) -> NotFoundError:
         return NotFoundError(
             error_code=ErrorCode.CONTROL_BINDING_NOT_FOUND,
             detail=f"Control binding with ID '{binding_id}' not found",

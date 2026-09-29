@@ -5,9 +5,14 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from agent_control_server.auth_framework import Operation, Principal, set_authorizer
-from agent_control_server.models import DEFAULT_NAMESPACE_KEY
+import pytest
+from agent_control_models.errors import ErrorCode, ErrorReason
 from fastapi.testclient import TestClient
+from httpx import Response
+
+from agent_control_server.auth_framework import Operation, Principal, set_authorizer
+from agent_control_server.errors import APIError, ForbiddenError, NotFoundError
+from agent_control_server.models import DEFAULT_NAMESPACE_KEY
 
 from .utils import VALID_CONTROL_PAYLOAD
 
@@ -109,9 +114,14 @@ def test_binding_id_routes_authorize_the_stored_target(client: TestClient) -> No
         target_type="custom_target",
         target_id="target-42",
     )["binding_id"]
-    calls: list[tuple[Operation, dict[str, Any] | None]] = []
+    calls: list[tuple[str, Operation, dict[str, Any] | None]] = []
 
     class RecordingAuthorizer:
+        async def resolve_identity(self, request: Any, operation: Operation) -> Principal:
+            del request
+            calls.append(("identity", operation, None))
+            return Principal(namespace_key=DEFAULT_NAMESPACE_KEY, is_admin=True)
+
         async def authorize(
             self,
             request: Any,
@@ -119,7 +129,7 @@ def test_binding_id_routes_authorize_the_stored_target(client: TestClient) -> No
             context: dict[str, Any] | None = None,
         ) -> Principal:
             del request
-            calls.append((operation, context))
+            calls.append(("authorize", operation, context))
             return Principal(namespace_key=DEFAULT_NAMESPACE_KEY, is_admin=True)
 
     set_authorizer(RecordingAuthorizer())
@@ -135,10 +145,228 @@ def test_binding_id_routes_authorize_the_stored_target(client: TestClient) -> No
     assert delete_resp.status_code == 200, delete_resp.text
     target_context = {"target_type": "custom_target", "target_id": "target-42"}
     assert calls == [
-        (Operation.CONTROL_BINDINGS_READ, target_context),
-        (Operation.CONTROL_BINDINGS_WRITE, target_context),
-        (Operation.CONTROL_BINDINGS_WRITE, target_context),
+        ("identity", Operation.CONTROL_BINDINGS_READ, None),
+        ("authorize", Operation.CONTROL_BINDINGS_READ, target_context),
+        ("identity", Operation.CONTROL_BINDINGS_WRITE, None),
+        ("authorize", Operation.CONTROL_BINDINGS_WRITE, target_context),
+        ("identity", Operation.CONTROL_BINDINGS_WRITE, None),
+        ("authorize", Operation.CONTROL_BINDINGS_WRITE, target_context),
     ]
+
+
+@pytest.mark.parametrize("method", ["get", "patch", "delete"])
+@pytest.mark.parametrize("exists", [True, False])
+@pytest.mark.parametrize(
+    ("api_key", "expected_error_code"),
+    [(None, "AUTH_MISSING_KEY"), ("wrong-key", "AUTH_INVALID_KEY")],
+)
+def test_binding_id_routes_preserve_authentication_errors(
+    method: str,
+    exists: bool,
+    api_key: str | None,
+    expected_error_code: str,
+    client: TestClient,
+    app: object,
+) -> None:
+    # Given: a caller with no valid credential and an existing or missing ID.
+    control_id = _create_control(client)
+    binding_id = _create_binding(client, control_id=control_id)["binding_id"]
+    headers = {} if api_key is None else {"X-API-Key": api_key}
+    unauthorized_client = TestClient(app, raise_server_exceptions=True, headers=headers)
+
+    # When: the caller accesses the binding by ID.
+    url = f"{_BINDINGS_URL}/{binding_id if exists else 999_999}"
+    if method == "get":
+        response = unauthorized_client.get(url)
+    elif method == "patch":
+        response = unauthorized_client.patch(url, json={"enabled": False})
+    else:
+        response = unauthorized_client.delete(url)
+
+    # Then: the route preserves the normal 401 challenge.
+    assert response.status_code == 401
+    assert response.json()["error_code"] == expected_error_code
+    assert response.headers["WWW-Authenticate"] == "ApiKey"
+
+
+@pytest.mark.parametrize("method", ["patch", "delete"])
+def test_binding_id_write_checks_local_access_before_lookup(
+    method: str, non_admin_client: TestClient
+) -> None:
+    # Given: a valid non-admin key and a missing binding ID.
+    url = f"{_BINDINGS_URL}/999999"
+
+    # When: the caller attempts an ID-based write.
+    if method == "patch":
+        response = non_admin_client.patch(url, json={"enabled": False})
+    else:
+        response = non_admin_client.delete(url)
+
+    # Then: the operation-wide access check preserves the normal 403.
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("method", ["get", "patch", "delete"])
+def test_binding_id_lookup_is_scoped_before_target_authorization(
+    method: str, client: TestClient
+) -> None:
+    class NamespaceAuthorizer:
+        namespace_key = "other-namespace"
+
+        def __init__(self) -> None:
+            self.target_calls = 0
+
+        async def resolve_identity(self, request: Any, operation: Operation) -> Principal:
+            del request, operation
+            return Principal(namespace_key=self.namespace_key, is_admin=True)
+
+        async def authorize(
+            self,
+            request: Any,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> Principal:
+            del request, operation, context
+            self.target_calls += 1
+            return Principal(namespace_key=self.namespace_key, is_admin=True)
+
+    # Given: a binding in another namespace and an identity in the default namespace.
+    authorizer = NamespaceAuthorizer()
+    set_authorizer(authorizer)
+    control_id = _create_control(client)
+    binding_id = _create_binding(client, control_id=control_id)["binding_id"]
+    authorizer.namespace_key = DEFAULT_NAMESPACE_KEY
+    authorizer.target_calls = 0
+
+    # When: the caller tries the foreign ID and a missing ID.
+    def request_id(requested_id: int) -> Response:
+        url = f"{_BINDINGS_URL}/{requested_id}"
+        if method == "get":
+            return client.get(url)
+        if method == "patch":
+            return client.patch(url, json={"enabled": False})
+        return client.delete(url)
+
+    foreign = request_id(binding_id)
+    missing = request_id(999_999)
+
+    # Then: neither ID reaches target authorization or mutates the binding.
+    assert foreign.status_code == missing.status_code == 404
+    assert foreign.json()["error_code"] == missing.json()["error_code"] == (
+        "CONTROL_BINDING_NOT_FOUND"
+    )
+    assert authorizer.target_calls == 0
+    authorizer.namespace_key = "other-namespace"
+    stored = client.get(f"{_BINDINGS_URL}/{binding_id}")
+    assert stored.status_code == 200
+    assert stored.json()["enabled"] is True
+
+
+def test_binding_id_identity_failure_does_not_depend_on_id(
+    client: TestClient,
+) -> None:
+    control_id = _create_control(client)
+    binding_id = _create_binding(client, control_id=control_id)["binding_id"]
+
+    class UnavailableAuthorizer:
+        async def resolve_identity(self, request: Any, operation: Operation) -> Principal:
+            del request, operation
+            raise APIError(
+                status_code=503,
+                error_code=ErrorCode.AUTH_MISCONFIGURED,
+                reason=ErrorReason.SERVICE_UNAVAILABLE,
+                detail="Authorization service unavailable.",
+            )
+
+        async def authorize(
+            self,
+            request: Any,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> Principal:
+            raise AssertionError("Target authorization must not run after identity failure")
+
+    # Given: the identity service is unavailable before any binding lookup.
+    set_authorizer(UnavailableAuthorizer())
+
+    # When: the caller requests an existing and a missing ID.
+    existing = client.get(f"{_BINDINGS_URL}/{binding_id}")
+    missing = client.get(f"{_BINDINGS_URL}/999999")
+
+    # Then: both fail with the same upstream error.
+    assert existing.status_code == missing.status_code == 503
+    assert existing.json()["error_code"] == missing.json()["error_code"] == "AUTH_MISCONFIGURED"
+
+
+@pytest.mark.parametrize("denial", ["forbidden", "not_found"])
+def test_binding_id_target_denial_looks_like_missing_binding(
+    denial: str, client: TestClient
+) -> None:
+    control_id = _create_control(client)
+    binding_id = _create_binding(client, control_id=control_id)["binding_id"]
+
+    class DenyingAuthorizer:
+        async def resolve_identity(self, request: Any, operation: Operation) -> Principal:
+            del request, operation
+            return Principal(namespace_key=DEFAULT_NAMESPACE_KEY)
+
+        async def authorize(
+            self,
+            request: Any,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> Principal:
+            del request, operation, context
+            if denial == "forbidden":
+                raise ForbiddenError(
+                    error_code=ErrorCode.AUTH_INSUFFICIENT_PRIVILEGES,
+                    detail="Target access denied.",
+                )
+            raise NotFoundError(
+                error_code=ErrorCode.AUTH_INVALID_KEY,
+                detail="Target not found.",
+                resource="Target",
+            )
+
+    # Given: an identity in the binding's namespace without target access.
+    set_authorizer(DenyingAuthorizer())
+
+    # When: the caller requests the denied binding and a missing ID.
+    denied = client.get(f"{_BINDINGS_URL}/{binding_id}")
+    missing = client.get(f"{_BINDINGS_URL}/999999")
+
+    # Then: both use the binding-not-found response contract.
+    assert denied.status_code == missing.status_code == 404
+    assert denied.json()["error_code"] == missing.json()["error_code"] == (
+        "CONTROL_BINDING_NOT_FOUND"
+    )
+
+
+def test_binding_id_legacy_authorizer_preflights_before_lookup(client: TestClient) -> None:
+    control_id = _create_control(client)
+    binding_id = _create_binding(client, control_id=control_id)["binding_id"]
+    contexts: list[dict[str, Any] | None] = []
+
+    class LegacyAuthorizer:
+        async def authorize(
+            self,
+            request: Any,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> Principal:
+            del request, operation
+            contexts.append(context)
+            return Principal(namespace_key=DEFAULT_NAMESPACE_KEY)
+
+    # Given: a provider that implements the original authorize-only contract.
+    set_authorizer(LegacyAuthorizer())
+
+    # When: an ID-based binding read succeeds.
+    response = client.get(f"{_BINDINGS_URL}/{binding_id}")
+
+    # Then: operation-wide auth runs before target auth.
+    assert response.status_code == 200
+    assert contexts == [None, {"target_type": "env", "target_id": "prod"}]
 
 
 def test_binding_id_delete_rechecks_the_authorized_namespace(
@@ -150,6 +378,10 @@ def test_binding_id_delete_rechecks_the_authorized_namespace(
     authorized_namespace = "other-namespace"
 
     class NamespaceAuthorizer:
+        async def resolve_identity(self, request: Any, operation: Operation) -> Principal:
+            del request, operation
+            return Principal(namespace_key=authorized_namespace, is_admin=True)
+
         async def authorize(
             self,
             request: Any,
@@ -180,6 +412,10 @@ def test_binding_id_patch_rechecks_the_authorized_namespace(
     authorized_namespace = "other-namespace"
 
     class NamespaceAuthorizer:
+        async def resolve_identity(self, request: Any, operation: Operation) -> Principal:
+            del request, operation
+            return Principal(namespace_key=authorized_namespace, is_admin=True)
+
         async def authorize(
             self,
             request: Any,
@@ -212,6 +448,11 @@ def test_binding_id_path_validation_runs_before_authorization(
     calls: list[Operation] = []
 
     class RecordingAuthorizer:
+        async def resolve_identity(self, request: Any, operation: Operation) -> Principal:
+            del request
+            calls.append(operation)
+            return Principal(namespace_key=DEFAULT_NAMESPACE_KEY, is_admin=True)
+
         async def authorize(
             self,
             request: Any,

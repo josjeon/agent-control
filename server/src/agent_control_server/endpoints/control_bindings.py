@@ -25,8 +25,9 @@ from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth_framework import Operation, Principal, get_authorizer, require_operation
+from ..auth_framework.core import IdentityResolver
 from ..db import AsyncSessionLocal, get_async_db
-from ..errors import BadRequestError
+from ..errors import BadRequestError, ForbiddenError, NotFoundError
 from ..models import ControlBinding
 from ..services.control_bindings import ControlBindingsService
 
@@ -79,15 +80,29 @@ def _require_binding_operation(
     """Authorize a by-ID route against the binding's stored target."""
 
     async def dependency(request: Request, binding_id: int) -> Principal:
+        authorizer = get_authorizer(operation)
+        if isinstance(authorizer, IdentityResolver):
+            identity = await authorizer.resolve_identity(request, operation)
+        else:
+            # Legacy providers can still resolve namespace-wide operations.
+            # Target-bound providers should implement IdentityResolver.
+            identity = await authorizer.authorize(request, operation)
         # Use a short-lived session so no database connection is held while the
         # authorization provider performs a potentially remote request.
         async with AsyncSessionLocal() as db:
             target_type, target_id = await ControlBindingsService(
                 db
-            ).get_binding_target_for_authorization_or_404(binding_id=binding_id)
+            ).get_binding_target_for_authorization_or_404(
+                namespace_key=identity.namespace_key, binding_id=binding_id
+            )
 
         context = {"target_type": target_type, "target_id": target_id}
-        return await get_authorizer(operation).authorize(request, operation, context)
+        try:
+            return await authorizer.authorize(request, operation, context)
+        except (ForbiddenError, NotFoundError) as exc:
+            # A caller cannot distinguish a binding it cannot access from a
+            # missing binding in its namespace.
+            raise ControlBindingsService.binding_not_found(binding_id) from exc
 
     return dependency
 

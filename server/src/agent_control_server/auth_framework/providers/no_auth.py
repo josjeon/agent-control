@@ -16,6 +16,10 @@ class NoAuthProvider(RequestAuthorizer):
     def __init__(self, *, default_namespace_key: str = DEFAULT_NAMESPACE_KEY) -> None:
         self._default_namespace_key = default_namespace_key
 
+    async def resolve_identity(self, request: Request, operation: Operation) -> Principal:
+        """Return the configured namespace when authentication is disabled."""
+        return await self.authorize(request, operation)
+
     async def authorize(
         self,
         request: Request,
