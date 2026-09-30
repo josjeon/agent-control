@@ -403,7 +403,7 @@ class HttpUpstreamAuthProvider(RequestAuthorizer):
                 reason=ErrorReason.INTERNAL_ERROR,
                 detail=(
                     "Authorization service rejected the authorization check "
-                    f"(status {status})."
+                    f"for {operation!r} (status {status})."
                 ),
                 hint=(
                     "Check that the Agent Control authorization request shape "

@@ -99,10 +99,13 @@ def _public_detail(status_code: int, error_code: ErrorCode | None, detail: str) 
     """
     Return safe client-facing detail text.
 
-    For 5xx statuses, this always returns a fixed safe template.
+    For 5xx statuses, this normally returns a fixed safe template.
     For 4xx statuses, this keeps caller-provided text after normalization.
     """
     safe_fallback = _default_public_detail(status_code, error_code)
+    # Temporary DevStack diagnostic only. Remove this before merging anything.
+    if status_code >= 500 and error_code == ErrorCode.AUTH_UPSTREAM_REJECTED:
+        return _normalize_public_text(detail)
     if status_code >= 500:
         return safe_fallback
 
